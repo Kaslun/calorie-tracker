@@ -3,6 +3,8 @@ package com.kalori.app.core.seed
 import android.util.Log
 import com.kalori.app.BuildConfig
 import com.kalori.app.data.fake.SampleData
+import com.kalori.app.data.matvaretabellen.MatvaretabellenImporter
+import com.kalori.app.data.seed.RestaurantSeed
 import com.kalori.app.domain.repository.FoodRepository
 import com.kalori.app.domain.repository.LogRepository
 import kotlinx.coroutines.CoroutineScope
@@ -13,32 +15,46 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Debug-only seed harness: pre-populates realistic Norwegian foods + several weeks of logs
- * so design iteration never requires manually logging "havregryn" 50 times.
+ * Seeds the Room database.
  *
- * Phase-1 scaffolding: seeds the (fake) repositories from [SampleData]. The data-layer agent
- * will repoint this at the real Room repos and the full Matvaretabellen import once those
- * land — the [seedIfNeeded]/[forceReseed] surface and the BuildConfig gating stay the same.
+ * Two distinct concerns:
+ *  - FOOD BACKBONE (both flavors): the Matvaretabellen micronutrient table and the Norwegian
+ *    restaurant-chain foods are real reference data the app needs to function. These import
+ *    idempotently on first run regardless of build type.
+ *  - DEV SAMPLE LOGS (debug only): weeks of fake logs so design iteration never requires
+ *    manually logging "havregryn" 50 times. Gated on BuildConfig.SEED_ON_FIRST_INSTALL;
+ *    release never seeds logs.
  *
- * Gated on BuildConfig.SEED_ON_FIRST_INSTALL — release builds never seed.
+ * All operations are idempotent (stable ids + IGNORE-on-conflict), so repeated calls are safe.
  */
 @Singleton
 class SeedManager @Inject constructor(
     private val foodRepository: FoodRepository,
     private val logRepository: LogRepository,
+    private val matvaretabellenImporter: MatvaretabellenImporter,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun seedIfNeeded() {
-        if (!BuildConfig.SEED_ON_FIRST_INSTALL) return
-        // Phase-1 note: fakes already initialize from SampleData, so this is a no-op safety
-        // net today. With real persistence, this becomes a "first run" guard + bulk insert.
-        Log.d(TAG, "Seed harness active (debug). Sample data available from SampleData.")
+        scope.launch {
+            // Food backbone — both flavors.
+            val imported = matvaretabellenImporter.importIfNeeded()
+            RestaurantSeed.foods().forEach { foodRepository.upsert(it) }
+            Log.d(TAG, "Food backbone ready (matvaretabellen inserted=$imported, restaurants seeded).")
+
+            // Dev sample logs — debug only.
+            if (BuildConfig.SEED_ON_FIRST_INSTALL) {
+                SampleData.logHistory().forEach { logRepository.add(it) }
+                Log.d(TAG, "Debug sample logs seeded.")
+            }
+        }
     }
 
-    /** Dev-menu affordance: clear and re-seed logs. Safe to call repeatedly. */
+    /** Dev-menu affordance: re-run the food import and re-seed sample logs. Safe to repeat. */
     fun forceReseed() {
         scope.launch {
+            matvaretabellenImporter.importNow()
+            RestaurantSeed.foods().forEach { foodRepository.upsert(it) }
             SampleData.foods.forEach { foodRepository.upsert(it) }
             SampleData.logHistory().forEach { logRepository.add(it) }
             Log.d(TAG, "Forced reseed complete.")
